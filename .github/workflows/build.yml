@@ -1,0 +1,35 @@
+name: Build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
+        
+    - name: Restore dependencies
+      run: dotnet restore /p:TreatWarningsAsErrors=false
+      
+    - name: Build
+      run: dotnet build --configuration Release --no-restore /p:TreatWarningsAsErrors=false
+      
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: RandomGamesPlayedWhileIdle
+        path: RandomGamesPlayedWhileIdle/bin/Release/net8.0/RandomGamesPlayedWhileIdle.dll
