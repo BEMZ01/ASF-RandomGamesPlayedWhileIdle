@@ -33,7 +33,7 @@ namespace RandomGamesPlayedWhileIdle {
 					.UrlGetToHtmlDocumentWithSession(new Uri(ArchiWebHandler.SteamCommunityURL,
 						$"profiles/{bot.SteamID}/games")).ConfigureAwait(false);
 
-				if (response?.Content?.SelectSingleNode("""//*[@id="gameslist_config"]""") is Element element) {
+				if (response?.Content?.QuerySelector("#gameslist_config") is IElement element) {
 					List<uint> list = GamesListRegex()
 						.Matches(element.OuterHtml)
 						.Select(static x => uint.Parse(x.Groups[1].Value, CultureInfo.InvariantCulture))
