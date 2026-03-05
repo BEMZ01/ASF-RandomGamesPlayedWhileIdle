@@ -3,24 +3,20 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Composition;
-using System.Globalization;
 using System.Linq;
 using System.Reflection;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
-using AngleSharp.Dom;
 using ArchiSteamFarm.Core;
 using ArchiSteamFarm.Plugins.Interfaces;
 using ArchiSteamFarm.Steam;
 using ArchiSteamFarm.Steam.Integration;
-using ArchiSteamFarm.Web.Responses;
 using SteamKit2;
 
 namespace RandomGamesPlayedWhileIdle {
 	[Export(typeof(IPlugin))]
-	public sealed partial class RandomGamesPlayedWhileIdlePlugin : IBotConnection, IBotModules {
+	public sealed class RandomGamesPlayedWhileIdlePlugin : IBotConnection, IBotModules {
 		private const int AbsoluteMaxGamesPlayed = 32;
 		private const double DefaultCycleIntervalMinutes = 30;
 		private const int DefaultMaxGamesPlayed = AbsoluteMaxGamesPlayed;
@@ -254,18 +250,13 @@ namespace RandomGamesPlayedWhileIdle {
 		}
 
 		private static async Task<List<uint>?> FetchGamesAsync(Bot bot) {
-			using HtmlDocumentResponse? response = await bot.ArchiWebHandler
-				.UrlGetToHtmlDocumentWithSession(new Uri(ArchiWebHandler.SteamCommunityURL,
-					$"profiles/{bot.SteamID}/games")).ConfigureAwait(false);
+			Dictionary<uint, string>? ownedGames = await bot.ArchiHandler.GetOwnedGames(bot.SteamID).ConfigureAwait(false);
 
-			if (response?.Content?.QuerySelector("#gameslist_config") is not IElement element) {
+			if (ownedGames == null || ownedGames.Count == 0) {
 				return null;
 			}
 
-			return GamesListRegex()
-				.Matches(element.OuterHtml)
-				.Select(static x => uint.Parse(x.Groups[1].Value, CultureInfo.InvariantCulture))
-				.ToList();
+			return ownedGames.Keys.ToList();
 		}
 
 		private static Queue<uint> BuildShuffledQueue(List<uint> games) {
@@ -278,9 +269,6 @@ namespace RandomGamesPlayedWhileIdle {
 
 			return new Queue<uint>(copy);
 		}
-
-		[GeneratedRegex(@"{&quot;appid&quot;:(\d+),&quot;name&quot;:&quot;")]
-		private static partial Regex GamesListRegex();
 
 		/// <summary>Per-bot plugin settings parsed from the bot JSON config.</summary>
 		private sealed record PluginBotConfig(double CycleIntervalMinutes, int MaxGamesPlayed, HashSet<uint> Blacklist) {
