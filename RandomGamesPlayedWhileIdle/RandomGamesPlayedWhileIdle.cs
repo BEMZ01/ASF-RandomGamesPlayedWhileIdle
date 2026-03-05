@@ -21,12 +21,14 @@ using SteamKit2;
 namespace RandomGamesPlayedWhileIdle {
 	[Export(typeof(IPlugin))]
 	public sealed partial class RandomGamesPlayedWhileIdlePlugin : IBotConnection, IBotModules {
-		private const int MaxGamesPlayedConcurrently = 32;
-		private const double DefaultRotationIntervalMinutes = 30;
+		private const int AbsoluteMaxGamesPlayed = 32;
+		private const double DefaultCycleIntervalMinutes = 30;
+		private const int DefaultMaxGamesPlayed = AbsoluteMaxGamesPlayed;
 
-		// Config key used in the bot JSON config file:
-		//   "RandomGamesPlayedWhileIdle_RotationIntervalMinutes": <number>
-		private const string RotationIntervalConfigKey = $"{nameof(RandomGamesPlayedWhileIdle)}_RotationIntervalMinutes";
+		// Config keys used in each bot's JSON config file.
+		private const string CycleIntervalConfigKey = "RandomGamesPlayedWhileIdleCycleIntervalMinutes";
+		private const string MaxGamesPlayedConfigKey = "RandomGamesPlayedWhileIdleMaxGamesPlayed";
+		private const string BlacklistConfigKey = "RandomGamesPlayedWhileIdleBlacklist";
 
 		// Cached reflection members – looked up once per process lifetime.
 		private static readonly PropertyInfo? GamesPlayedWhileIdleProperty =
@@ -37,39 +39,62 @@ namespace RandomGamesPlayedWhileIdle {
 		private static readonly MethodInfo? ResetGamesPlayedMethod =
 			typeof(Bot).GetMethod("ResetGamesPlayed", BindingFlags.NonPublic | BindingFlags.Instance);
 
-		// Per-bot rotation intervals read from the bot config file.
-		private readonly ConcurrentDictionary<Bot, double> BotRotationIntervals = new();
+		// Per-bot settings read from the bot config file.
+		private readonly ConcurrentDictionary<Bot, PluginBotConfig> BotConfigs = new();
 		private readonly ConcurrentDictionary<Bot, BotState> BotStates = new();
 
 		public string Name => nameof(RandomGamesPlayedWhileIdle);
 		public Version Version => typeof(RandomGamesPlayedWhileIdlePlugin).Assembly.GetName().Version!;
 
 		public Task OnLoaded() {
-			ASF.ArchiLogger.LogGenericInfo($"[{Name}] Plugin loaded (v{Version}). Default rotation interval: {DefaultRotationIntervalMinutes} minutes (configurable per-bot via \"{RotationIntervalConfigKey}\" in the bot config).");
+			ASF.ArchiLogger.LogGenericInfo($"[{Name}] Plugin loaded (v{Version}). Configurable per-bot via \"{CycleIntervalConfigKey}\", \"{MaxGamesPlayedConfigKey}\", \"{BlacklistConfigKey}\" in each bot config.");
 
 			return Task.CompletedTask;
 		}
 
 		/// <summary>
-		///     Called by ASF right after the bot config is initialised. Reads the optional
-		///     <c>RandomGamesPlayedWhileIdle_RotationIntervalMinutes</c> property from the bot's JSON
-		///     config file and stores it for use when the bot logs on.
+		///     Called by ASF right after the bot config is initialised. Reads the three optional
+		///     plugin properties from the bot's JSON config file.
 		/// </summary>
 		public Task OnBotInitModules(Bot bot, IReadOnlyDictionary<string, JsonElement>? additionalConfigProperties = null) {
 			ArgumentNullException.ThrowIfNull(bot);
 
-			double intervalMinutes = DefaultRotationIntervalMinutes;
+			double cycleIntervalMinutes = DefaultCycleIntervalMinutes;
+			int maxGamesPlayed = DefaultMaxGamesPlayed;
+			HashSet<uint> blacklist = [];
 
-			if (additionalConfigProperties != null &&
-				additionalConfigProperties.TryGetValue(RotationIntervalConfigKey, out JsonElement configValue) &&
-				configValue.ValueKind == JsonValueKind.Number &&
-				configValue.TryGetDouble(out double parsedMinutes) &&
-				parsedMinutes > 0) {
-				intervalMinutes = parsedMinutes;
-				bot.ArchiLogger.LogGenericInfo($"[{Name}] Config: rotation interval set to {intervalMinutes} minutes.");
+			if (additionalConfigProperties != null) {
+				// --- CycleIntervalMinutes ---
+				if (additionalConfigProperties.TryGetValue(CycleIntervalConfigKey, out JsonElement intervalElem) &&
+					intervalElem.ValueKind == JsonValueKind.Number &&
+					intervalElem.TryGetDouble(out double parsedInterval) &&
+					parsedInterval > 0) {
+					cycleIntervalMinutes = parsedInterval;
+				}
+
+				// --- MaxGamesPlayed ---
+				if (additionalConfigProperties.TryGetValue(MaxGamesPlayedConfigKey, out JsonElement maxElem) &&
+					maxElem.ValueKind == JsonValueKind.Number &&
+					maxElem.TryGetInt32(out int parsedMax) &&
+					parsedMax > 0) {
+					maxGamesPlayed = Math.Min(parsedMax, AbsoluteMaxGamesPlayed);
+				}
+
+				// --- Blacklist ---
+				if (additionalConfigProperties.TryGetValue(BlacklistConfigKey, out JsonElement blacklistElem) &&
+					blacklistElem.ValueKind == JsonValueKind.Array) {
+					foreach (JsonElement entry in blacklistElem.EnumerateArray()) {
+						if (entry.ValueKind == JsonValueKind.Number && entry.TryGetUInt32(out uint appID)) {
+							blacklist.Add(appID);
+						}
+					}
+				}
 			}
 
-			BotRotationIntervals[bot] = intervalMinutes;
+			PluginBotConfig config = new(cycleIntervalMinutes, maxGamesPlayed, blacklist);
+			BotConfigs[bot] = config;
+
+			bot.ArchiLogger.LogGenericInfo($"[{Name}] Config loaded – interval: {cycleIntervalMinutes} min, max games: {maxGamesPlayed}, blacklisted: {blacklist.Count}.");
 
 			return Task.CompletedTask;
 		}
@@ -104,12 +129,25 @@ namespace RandomGamesPlayedWhileIdle {
 					return;
 				}
 
+				PluginBotConfig botConfig = BotConfigs.GetValueOrDefault(bot, PluginBotConfig.Default);
+
+				// Apply blacklist.
+				if (botConfig.Blacklist.Count > 0) {
+					int before = allGames.Count;
+					allGames.RemoveAll(id => botConfig.Blacklist.Contains(id));
+					bot.ArchiLogger.LogGenericInfo($"[{Name}] Blacklist removed {before - allGames.Count} game(s). {allGames.Count} remain.");
+				}
+
+				if (allGames.Count == 0) {
+					bot.ArchiLogger.LogGenericWarning($"[{Name}] All games were blacklisted. Plugin will not rotate games.");
+
+					return;
+				}
+
 				bot.ArchiLogger.LogGenericInfo($"[{Name}] Found {allGames.Count} game(s) in library. Building rotation queue...");
 
-				double intervalMinutes = BotRotationIntervals.GetValueOrDefault(bot, DefaultRotationIntervalMinutes);
-				TimeSpan rotationInterval = TimeSpan.FromMinutes(intervalMinutes);
-
-				BotState state = new(allGames);
+				TimeSpan rotationInterval = TimeSpan.FromMinutes(botConfig.CycleIntervalMinutes);
+				BotState state = new(allGames, botConfig.MaxGamesPlayed);
 				BotStates[bot] = state;
 
 				ApplyNextBatch(bot, state);
@@ -121,7 +159,7 @@ namespace RandomGamesPlayedWhileIdle {
 					rotationInterval
 				);
 
-				bot.ArchiLogger.LogGenericInfo($"[{Name}] Rotation timer started. Next rotation in {intervalMinutes} minutes.");
+				bot.ArchiLogger.LogGenericInfo($"[{Name}] Rotation timer started. Next rotation in {botConfig.CycleIntervalMinutes} minutes.");
 			} catch (Exception e) {
 				bot.ArchiLogger.LogGenericException(e);
 			}
@@ -150,6 +188,19 @@ namespace RandomGamesPlayedWhileIdle {
 							return;
 						}
 
+						// Re-apply blacklist when rebuilding.
+						PluginBotConfig botConfig = BotConfigs.GetValueOrDefault(bot, PluginBotConfig.Default);
+
+						if (botConfig.Blacklist.Count > 0) {
+							freshGames.RemoveAll(id => botConfig.Blacklist.Contains(id));
+						}
+
+						if (freshGames.Count == 0) {
+							bot.ArchiLogger.LogGenericWarning($"[{Name}] Re-fetch returned no games after blacklist filter. Skipping rotation.");
+
+							return;
+						}
+
 						bot.ArchiLogger.LogGenericInfo($"[{Name}] Re-fetched {freshGames.Count} game(s). Rebuilding queue.");
 						state.RebuildQueue(freshGames);
 					}
@@ -164,9 +215,9 @@ namespace RandomGamesPlayedWhileIdle {
 		}
 
 		private void ApplyNextBatch(Bot bot, BotState state) {
-			List<uint> batch = new(MaxGamesPlayedConcurrently);
+			List<uint> batch = new(state.MaxGamesPlayed);
 
-			while (batch.Count < MaxGamesPlayedConcurrently && state.Queue.Count > 0) {
+			while (batch.Count < state.MaxGamesPlayed && state.Queue.Count > 0) {
 				batch.Add(state.Queue.Dequeue());
 			}
 
@@ -231,14 +282,21 @@ namespace RandomGamesPlayedWhileIdle {
 		[GeneratedRegex(@"{&quot;appid&quot;:(\d+),&quot;name&quot;:&quot;")]
 		private static partial Regex GamesListRegex();
 
+		/// <summary>Per-bot plugin settings parsed from the bot JSON config.</summary>
+		private sealed record PluginBotConfig(double CycleIntervalMinutes, int MaxGamesPlayed, HashSet<uint> Blacklist) {
+			public static readonly PluginBotConfig Default = new(DefaultCycleIntervalMinutes, DefaultMaxGamesPlayed, []);
+		}
+
 		private sealed class BotState : IDisposable {
+			public int MaxGamesPlayed { get; }
 			public Queue<uint> Queue { get; private set; }
 			public Timer? RotationTimer { get; set; }
 
 			// Ensures only one rotation runs at a time even if a timer fires while a re-fetch is in progress.
 			public SemaphoreSlim RotationLock { get; } = new(1, 1);
 
-			public BotState(List<uint> allGames) {
+			public BotState(List<uint> allGames, int maxGamesPlayed) {
+				MaxGamesPlayed = maxGamesPlayed;
 				Queue = BuildShuffledQueue(allGames);
 			}
 
@@ -253,3 +311,4 @@ namespace RandomGamesPlayedWhileIdle {
 		}
 	}
 }
+
