@@ -6,6 +6,7 @@ using System.Composition;
 using System.Globalization;
 using System.Linq;
 using System.Reflection;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -19,9 +20,13 @@ using SteamKit2;
 
 namespace RandomGamesPlayedWhileIdle {
 	[Export(typeof(IPlugin))]
-	public sealed partial class RandomGamesPlayedWhileIdlePlugin : IBotConnection {
+	public sealed partial class RandomGamesPlayedWhileIdlePlugin : IBotConnection, IBotModules {
 		private const int MaxGamesPlayedConcurrently = 32;
-		private static readonly TimeSpan RotationInterval = TimeSpan.FromMinutes(30);
+		private const double DefaultRotationIntervalMinutes = 30;
+
+		// Config key used in the bot JSON config file:
+		//   "RandomGamesPlayedWhileIdle_RotationIntervalMinutes": <number>
+		private const string RotationIntervalConfigKey = $"{nameof(RandomGamesPlayedWhileIdle)}_RotationIntervalMinutes";
 
 		// Cached reflection members – looked up once per process lifetime.
 		private static readonly PropertyInfo? GamesPlayedWhileIdleProperty =
@@ -32,13 +37,39 @@ namespace RandomGamesPlayedWhileIdle {
 		private static readonly MethodInfo? ResetGamesPlayedMethod =
 			typeof(Bot).GetMethod("ResetGamesPlayed", BindingFlags.NonPublic | BindingFlags.Instance);
 
+		// Per-bot rotation intervals read from the bot config file.
+		private readonly ConcurrentDictionary<Bot, double> BotRotationIntervals = new();
 		private readonly ConcurrentDictionary<Bot, BotState> BotStates = new();
 
 		public string Name => nameof(RandomGamesPlayedWhileIdle);
 		public Version Version => typeof(RandomGamesPlayedWhileIdlePlugin).Assembly.GetName().Version!;
 
 		public Task OnLoaded() {
-			ASF.ArchiLogger.LogGenericInfo($"[{Name}] Plugin loaded (v{Version}). Games will rotate every {RotationInterval.TotalMinutes} minutes.");
+			ASF.ArchiLogger.LogGenericInfo($"[{Name}] Plugin loaded (v{Version}). Default rotation interval: {DefaultRotationIntervalMinutes} minutes (configurable per-bot via \"{RotationIntervalConfigKey}\" in the bot config).");
+
+			return Task.CompletedTask;
+		}
+
+		/// <summary>
+		///     Called by ASF right after the bot config is initialised. Reads the optional
+		///     <c>RandomGamesPlayedWhileIdle_RotationIntervalMinutes</c> property from the bot's JSON
+		///     config file and stores it for use when the bot logs on.
+		/// </summary>
+		public Task OnBotInitModules(Bot bot, IReadOnlyDictionary<string, JsonElement>? additionalConfigProperties = null) {
+			ArgumentNullException.ThrowIfNull(bot);
+
+			double intervalMinutes = DefaultRotationIntervalMinutes;
+
+			if (additionalConfigProperties != null &&
+				additionalConfigProperties.TryGetValue(RotationIntervalConfigKey, out JsonElement configValue) &&
+				configValue.ValueKind == JsonValueKind.Number &&
+				configValue.TryGetDouble(out double parsedMinutes) &&
+				parsedMinutes > 0) {
+				intervalMinutes = parsedMinutes;
+				bot.ArchiLogger.LogGenericInfo($"[{Name}] Config: rotation interval set to {intervalMinutes} minutes.");
+			}
+
+			BotRotationIntervals[bot] = intervalMinutes;
 
 			return Task.CompletedTask;
 		}
@@ -75,6 +106,9 @@ namespace RandomGamesPlayedWhileIdle {
 
 				bot.ArchiLogger.LogGenericInfo($"[{Name}] Found {allGames.Count} game(s) in library. Building rotation queue...");
 
+				double intervalMinutes = BotRotationIntervals.GetValueOrDefault(bot, DefaultRotationIntervalMinutes);
+				TimeSpan rotationInterval = TimeSpan.FromMinutes(intervalMinutes);
+
 				BotState state = new(allGames);
 				BotStates[bot] = state;
 
@@ -83,11 +117,11 @@ namespace RandomGamesPlayedWhileIdle {
 				state.RotationTimer = new Timer(
 					_ => { _ = RotateAsync(bot, state); },
 					null,
-					RotationInterval,
-					RotationInterval
+					rotationInterval,
+					rotationInterval
 				);
 
-				bot.ArchiLogger.LogGenericInfo($"[{Name}] Rotation timer started. Next rotation in {RotationInterval.TotalMinutes} minutes.");
+				bot.ArchiLogger.LogGenericInfo($"[{Name}] Rotation timer started. Next rotation in {intervalMinutes} minutes.");
 			} catch (Exception e) {
 				bot.ArchiLogger.LogGenericException(e);
 			}
