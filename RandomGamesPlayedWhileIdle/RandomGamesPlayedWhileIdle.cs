@@ -264,7 +264,10 @@ namespace RandomGamesPlayedWhileIdle {
 
 			// CA5394: Random.Shared is intentionally used here – game order is not a security concern.
 #pragma warning disable CA5394
-			Random.Shared.Shuffle(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(copy));
+			for (int i = copy.Count - 1; i > 0; i--) {
+				int j = Random.Shared.Next(i + 1);
+				(copy[i], copy[j]) = (copy[j], copy[i]);
+			}
 #pragma warning restore CA5394
 
 			return new Queue<uint>(copy);
